@@ -3,6 +3,8 @@
 LPL 数据分析中心 · Streamlit Demo
 数据来源: Games of Legends (gol.gg) 公开统计页面
 """
+import json
+import os
 import re
 import socket
 import urllib.parse
@@ -17,6 +19,23 @@ from streamlit_option_menu import option_menu
 socket.setdefaulttimeout(30)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LPL-Demo/1.0"}
 BASE = "https://gol.gg"
+
+# ============================================================
+# 英雄名汉化 (官方 Data Dragon zh_CN 映射, 静态内置)
+# ============================================================
+
+def _norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "champion_zh.json"),
+          encoding="utf-8") as _f:
+    _CHAMP_RAW = json.load(_f)
+CHAMP_ZH = {_norm_name(k): v for k, v in _CHAMP_RAW.items()}
+
+
+def zh_champ(name):
+    return CHAMP_ZH.get(_norm_name(name), name)
 
 # ============================================================
 # 数据层
@@ -139,6 +158,8 @@ def fetch_champions(tournament):
     for c in ["KDA", "CSM", "DPM", "GPM"]:
         df[c + "_v"] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["选取_v"])
+    # 英雄名汉化: 中文名列 (保留英文列用于悬停对照)
+    df["英雄中文名"] = df["英雄"].map(zh_champ)
     return df
 
 
@@ -282,9 +303,12 @@ def page_overview(tour, teams, players, champs):
 
     st.markdown("##### 英雄优先级 TOP 12 (BP率 = (选取+禁用)/总场次)")
     d = champs.sort_values("BP率_v", ascending=False).head(12)
+    xlabels = [zh_c + " " + en for zh_c, en in zip(d["英雄中文名"], d["英雄"])]
     fig = go.Figure()
-    fig.add_bar(x=d["英雄"], y=d["选取_v"], name="选取", marker_color=RED)
-    fig.add_bar(x=d["英雄"], y=d["禁用_v"], name="禁用", marker_color="#8a5cf6")
+    fig.add_bar(x=xlabels, y=d["选取_v"], name="选取", marker_color=RED,
+                customdata=d["英雄"], hovertemplate="%{customdata}<br>选取: %{y}<extra></extra>")
+    fig.add_bar(x=xlabels, y=d["禁用_v"], name="禁用", marker_color="#8a5cf6",
+                customdata=d["英雄"], hovertemplate="%{customdata}<br>禁用: %{y}<extra></extra>")
     fig.update_layout(barmode="group")
     st.plotly_chart(style_fig(fig, 340), width='stretch')
 
@@ -356,24 +380,27 @@ def page_champions(champs, teams):
     hero("英雄页 · 英雄 BP 与强度分析", "英雄页 · 选取/禁用/胜率全覆盖")
     n_total = int(champs["选取_v"].sum() + champs["禁用_v"].sum())
     st.markdown(f"##### 英雄数据总表 (共 {len(champs)} 个英雄登场, BP 总人次 {n_total})")
-    show = champs[["英雄", "选取", "禁用", "BP率", "胜率", "KDA", "DPM", "CSM"]].copy()
+    show = champs[["英雄中文名", "英雄", "选取", "禁用", "BP率", "胜率", "KDA", "DPM", "CSM"]].copy()
+    show.columns = ["英雄", "英文名", "选取", "禁用", "BP率", "胜率", "KDA", "DPM", "CSM"]
     st.dataframe(show, hide_index=True, width='stretch', height=440)
 
     left, right = st.columns(2)
     with left:
         st.markdown("##### 强度四象限: 胜率 vs BP率")
-        fig = px.scatter(champs, x="BP率_v", y="胜率_v", text="英雄",
+        fig = px.scatter(champs, x="BP率_v", y="胜率_v", text="英雄中文名",
                          size="选取_v", color="胜率_v",
                          color_continuous_scale=["#5c667e", "#4c8de5", "#e5484d"],
-                         hover_data=["选取", "禁用", "KDA"])
+                         hover_data={"英雄": True, "选取": True, "禁用": True, "KDA": True})
         fig.add_hline(y=50, line_dash="dot", line_color="#39435c")
         fig.update_traces(textposition="top center", textfont_size=8)
         st.plotly_chart(style_fig(fig, 430), width='stretch')
     with right:
         st.markdown("##### 禁用榜 TOP 12")
         d = champs.sort_values("禁用_v", ascending=False).head(12)
-        fig = px.bar(d, x="禁用_v", y="英雄", orientation="h", color="禁用_v",
-                     color_continuous_scale=["#1f1533", "#8a5cf6"], text="禁用")
+        fig = px.bar(d, x="禁用_v", y="英雄中文名", orientation="h", color="禁用_v",
+                     color_continuous_scale=["#1f1533", "#8a5cf6"], text="禁用",
+                     custom_data=["英雄"],
+                     hovertemplate="%{customdata[0]} (%{y})<br>禁用: %{x}<extra></extra>")
         fig.update_yaxes(autorange="reversed")
         fig.update_traces(textposition="outside", textfont_color="#c3a9f5")
         fig.update_layout(coloraxis_showscale=False)
