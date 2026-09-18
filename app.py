@@ -181,6 +181,142 @@ def fetch_champions(tournament):
     return df
 
 
+# ---------- 详情页 (战队/英雄) ----------
+
+def _detail_url(kind, path):
+    return urllib.parse.quote(BASE + "/" + kind + "/" + path, safe=":/%")
+
+
+def _field(html, label):
+    """提取 '<td>label:</td><td>value</td>' 的 value, 清洗后返回 str|None"""
+    m = re.search(re.escape(label) + r"\s*</td>\s*<td[^>]*>(.*?)</td>", html, re.S)
+    if not m:
+        return None
+    v = _cell_text(m.group(1))
+    return v if v not in ("", "-", "&nbsp;") else None
+
+
+def _num(v):
+    try:
+        return float(re.sub(r"[^0-9.\-]", "", v))
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_team_ids(tournament):
+    tok = urllib.parse.quote(tournament)
+    html = _get(BASE + "/teams/list/season-ALL/split-ALL/tournament-%s/" % tok)
+    ids = {}
+    for tid, name in re.findall(
+            r"team-stats/(\d+)/[^>]*>\s*([^<>]+?)\s*</a>", html):
+        ids.setdefault(name.strip(), tid)
+    return ids
+
+
+@st.cache_data(ttl=1800, show_spinner="正在拉取战队详情 ...")
+def fetch_team_detail(tournament, team_id):
+    tok = urllib.parse.quote(tournament)
+    html = _get(_detail_url("teams", "team-stats/%s/split-ALL/tournament-%s/" % (team_id, tok)))
+    d = {
+        "gpm": _num(_field(html, "Gold Per Minute:")),
+        "gdm": _num(_field(html, "Gold Differential per Minute:")),
+        "gd15": _num(_field(html, "Gold Differential at 15 min:")),
+        "wr_ahead15": _field(html, "Win Rate when ahead at 15 min:"),
+        "csm": _num(_field(html, "CS Per Minute:")),
+        "csd15": _num(_field(html, "CS Differential at 15 min:")),
+        "td15": _num(_field(html, "Tower Differential at 15 min:")),
+        "avg_td": _num(_field(html, "Avg. Tower Difference:")),
+        "dpm": _num(_field(html, "Damage Per Minute:")),
+        "fb": _field(html, "First Blood:"),
+        "plates": _field(html, "Plates / game"),
+        "dragons": _field(html, "Dragons / game:"),
+        "grubs": _field(html, "Voidgrubs / game:"),
+        "herald": _field(html, "Herald / game:"),
+        "nashors": _field(html, "Nashors / game:"),
+        "vspm": _num(_field(html, "Vision Score Per Minute:")),
+        "wpm": _num(_field(html, "Wards Per Minute:")),
+        "vwpm": _num(_field(html, "Vision Wards Per Minute:")),
+    }
+    # 蓝/红方胜负 (图表 JS 数据)
+    m = re.search(r"WRData\s*=\s*.*?Wins.*?data\s*:\s*\[([^\]]*)\].*?"
+                  r"Losses.*?data\s*:\s*\[([^\]]*)\]", html, re.S)
+    if m:
+        def _arr(s):
+            return [int(x) if x.strip().isdigit() else 0 for x in s.split(",")]
+        w, l = _arr(m.group(1)), _arr(m.group(2))
+        d["blue_w"], d["blue_l"] = (w + [0, 0])[:2]
+        d["red_w"], d["red_l"] = (l + [0, 0])[:2]
+    # 选手阵容表 (最后一组含 Champions played 的表)
+    d["roster"] = []
+    for tb in re.findall(r"<table[^>]*>(.*?)</table>", html, re.S):
+        if "Champions played" not in tb:
+            continue
+        for r in re.findall(r"<tr[^>]*>(.*?)</tr>", tb, re.S)[1:]:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", r, re.S)
+            if len(cells) < 8:
+                continue
+            hero_pool = re.findall(
+                r"([A-Za-z][A-Za-z' .&-]*?)\s*Winrate\s*:\s*([\d.\-]+)%\s*KDA\s*:\s*([\d.\-]+)\s*(\d+)",
+                _cell_text(cells[7]).replace("Winrate : ", "Winrate : "))
+            d["roster"].append({
+                "位置": _cell_text(cells[0]),
+                "选手": _cell_text(cells[1]),
+                "KDA": _cell_text(cells[2]),
+                "参团率": _cell_text(cells[3]),
+                "分均视野分": _cell_text(cells[4]),
+                "伤害占比": _cell_text(cells[5]),
+                "经济占比": _cell_text(cells[6]),
+                "英雄池": hero_pool,
+            })
+        break
+    return d
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_champion_ids(tournament):
+    tok = urllib.parse.quote(tournament)
+    html = _get(BASE + "/champion/list/season-ALL/split-ALL/tournament-%s/" % tok)
+    ids = {}
+    for cid, raw in re.findall(
+            r"champion-stats/(\d+)/[^>]*>(.*?)</a>", html, re.S):
+        name = _cell_text(raw)
+        if name:
+            ids.setdefault(name, cid)
+    return ids
+
+
+@st.cache_data(ttl=1800, show_spinner="正在拉取英雄详情 ...")
+def fetch_champion_detail(tournament, champ_id):
+    tok = urllib.parse.quote(tournament)
+    html = _get(_detail_url("champion", "champion-stats/%s/season-ALL/split-ALL/tournament-%s/"
+                            % (champ_id, tok)))
+    bans = _field(html, "Bans:")
+    picks = _field(html, "Picks:")
+    d = {
+        "bans": bans, "picks": picks,
+        "prio": _field(html, "Priority Score:"),
+        "series": _field(html, "Presence by Series:"),
+        "avg_round": _field(html, "Avg Round Picked:"),
+        "wr": _field(html, "Win rate:"),
+        "roles": [],
+    }
+    m_role = re.search(r"<th[^>]*>\s*Role\s*</th>", html)
+    if m_role:
+        seg = html[m_role.start():]
+        end = seg.find("</tbody>")
+        tb = seg[:end if end > 0 else 3500]
+        # 分路表的胜率列内嵌条形图小表格, 先剥离避免列错位
+        tb = re.sub(r"<table class=.tablebarg[^>]*>.*?</table>", " ", tb, flags=re.S)
+        for r in re.findall(r"<tr[^>]*>(.*?)</tr>", tb, re.S):
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", r, re.S)
+            vals = [_cell_text(c) for c in cells]
+            vals = [v for v in vals if v]
+            if len(vals) >= 5 and vals[0] in ("TOP", "JUNGLE", "MID", "BOT", "SUPPORT"):
+                d["roles"].append(vals[:5])
+    return d
+
+
 # ============================================================
 # 样式
 # ============================================================
@@ -331,8 +467,76 @@ def page_overview(tour, teams, players, champs):
     st.plotly_chart(style_fig(fig, 340), width='stretch')
 
 
-def page_teams(teams):
-    hero("战队页 · 战队榜单与风格对比", "战队页 · 数据口径: 本届赛事常规赛")
+def _metric_block(cols, items):
+    """在若干列里排布 (标签, 值) 指标"""
+    per = max(1, len(items) // len(cols) + (1 if len(items) % len(cols) else 0))
+    for ci, col in enumerate(cols):
+        with col:
+            for label, val in items[ci * per:(ci + 1) * per]:
+                st.metric(label, val if val not in (None, "", "-") else "暂无")
+
+
+def render_team_detail(tour, team_name):
+    tids = fetch_team_ids(tour)
+    tid = tids.get(team_name)
+    if not tid:
+        st.warning("未找到该战队详情数据。")
+        return
+    d = fetch_team_detail(tour, tid)
+    st.markdown(f"**{team_name} · 深度数据**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown("**💰 经济运营**")
+        st.metric("分均经济 GPM", d["gpm"])
+        st.metric("每分钟经济差", ("+" if (d["gdm"] or 0) > 0 else "") + str(d["gdm"]))
+        st.metric("15分钟经济差", d["gd15"])
+        st.metric("15分钟领先时胜率", d["wr_ahead15"] or "暂无")
+    with c2:
+        st.markdown("**⚔️ 进攻输出**")
+        st.metric("分均伤害 DPM", d["dpm"])
+        st.metric("一血率", d["fb"] or "暂无")
+        st.metric("分均补刀 CSM", d["csm"])
+        st.metric("15分钟补刀差", d["csd15"])
+    with c3:
+        st.markdown("**🐉 资源控制**")
+        st.metric("场均小龙", d["dragons"] or "暂无")
+        st.metric("场均虚空幼虫", d["grubs"] or "暂无")
+        st.metric("场均峡谷先锋", d["herald"] or "暂无")
+        st.metric("场均男爵", d["nashors"] or "暂无")
+    with c4:
+        st.markdown("**👁️ 视野与边路**")
+        st.metric("分均视野分 VSPM", d["vspm"])
+        st.metric("分均排眼", d["vwpm"])
+        bw, bl = d.get("blue_w", 0), d.get("blue_l", 0)
+        rw, rl = d.get("red_w", 0), d.get("red_l", 0)
+        st.metric("蓝方战绩", f"{bw} 胜 {bl} 负")
+        st.metric("红方战绩", f"{rw} 胜 {rl} 负")
+
+    # 分路胜负 + 平均塔差
+    left, right = st.columns([1, 2])
+    with left:
+        if bw + bl + rw + rl:
+            fig = go.Figure(data=[go.Pie(
+                labels=["蓝方胜", "蓝方负", "红方胜", "红方负"],
+                values=[bw, bl, rw, rl], hole=0.55,
+                marker=dict(colors=[RED, "#3a3f4d", GOLD, "#4a4230"]))])
+            fig.update_layout(title_text="分路胜负分布", **{k: v for k, v in PLOTLY_LAYOUT.items() if k != "height"})
+            st.plotly_chart(style_fig(fig, 260), width='stretch')
+    with right:
+        st.markdown("**👥 首发阵容与英雄池**")
+        for r in d.get("roster", [])[:7]:
+            pool = r.get("英雄池") or []
+            pool_txt = " · ".join(
+                f"{zh_champ(h)} {wr}%" for h, wr, _, _ in pool[:3]) if pool else ""
+            st.markdown(
+                f"`{r['位置']}` **{r['选手']}** — KDA {r['KDA']} · 参团 {r['参团率']} · "
+                f"伤害占比 {r['伤害占比']} · 经济占比 {r['经济占比']}"
+                + (f" <br><small>常备英雄: {pool_txt}</small>" if pool_txt else ""),
+                unsafe_allow_html=True)
+
+
+def page_teams(tour, teams):
+    hero("战队页 · 战队榜单 / 风格对比 / 单队深度数据", "战队页 · 数据口径: 当前所选赛事")
     st.markdown("##### 战队数据总表")
     show = teams[["战队", "场次", "胜率", "K:D", "场均时长", "场均击杀", "场均死亡",
                   "场均推塔", "首选边率", "蓝方率"]].copy()
@@ -355,6 +559,11 @@ def page_teams(teams):
                          color_continuous_scale=["#132743", "#4c8de5"])
         fig.update_traces(textposition="top center", textfont_size=10)
         st.plotly_chart(style_fig(fig, 400), width='stretch')
+
+    st.divider()
+    st.markdown("##### 🔍 单队深度数据")
+    sel = st.selectbox("选择战队", teams["战队"].tolist())
+    render_team_detail(tour, sel)
 
 
 def page_players(players):
@@ -394,8 +603,8 @@ def page_players(players):
     st.plotly_chart(style_fig(fig, 360), width='stretch')
 
 
-def page_champions(champs, teams):
-    hero("英雄页 · 英雄 BP 与强度分析", "英雄页 · 选取/禁用/胜率全覆盖")
+def page_champions(tour, champs):
+    hero("英雄页 · 英雄 BP / 强度分析 / 单英雄深度数据", "英雄页 · 选取/禁用/胜率全覆盖")
     n_total = int(champs["选取_v"].sum() + champs["禁用_v"].sum())
     st.markdown(f"##### 英雄数据总表 (共 {len(champs)} 个英雄登场, BP 总人次 {n_total})")
     show = champs[["英雄中文名", "英雄", "选取", "禁用", "BP率", "胜率", "KDA", "DPM", "CSM"]].copy()
@@ -417,12 +626,251 @@ def page_champions(champs, teams):
         d = champs.sort_values("禁用_v", ascending=False).head(12)
         fig = px.bar(d, x="禁用_v", y="英雄中文名", orientation="h", color="禁用_v",
                      color_continuous_scale=["#1f1533", "#8a5cf6"], text="禁用",
-                     custom_data=["英雄"],
-                     hovertemplate="%{customdata[0]} (%{y})<br>禁用: %{x}<extra></extra>")
+                     custom_data=["英雄"])
+        fig.update_traces(hovertemplate="%{customdata[0]} (%{y})<br>禁用: %{x}<extra></extra>")
         fig.update_yaxes(autorange="reversed")
         fig.update_traces(textposition="outside", textfont_color="#c3a9f5")
         fig.update_layout(coloraxis_showscale=False)
         st.plotly_chart(style_fig(fig, 430), width='stretch')
+
+    st.divider()
+    st.markdown("##### 🔍 单英雄深度数据")
+    sel = st.selectbox("选择英雄", champs["英雄中文名"].tolist(),
+                       format_func=lambda n: n)
+    row = champs[champs["英雄中文名"] == sel].iloc[0]
+    cd = fetch_champion_detail(tour, fetch_champion_ids(tour).get(row["英雄"], ""))
+    st.markdown(f"**{sel} ({row['英雄']}) · BP 明细**")
+    m = re.match(r"(\d+)\s*\(\s*(\d+)\s*/\s*(\d+)\s*\)", cd.get("bans") or "")
+    pm = re.match(r"(\d+)\s*\(\s*(\d+)\s*/\s*(\d+)\s*\)", cd.get("picks") or "")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("总禁用", m.group(1) if m else cd.get("bans") or "0",
+              ("红 %s / 蓝 %s" % (m.group(2), m.group(3))) if m else None)
+    c2.metric("总选取", pm.group(1) if pm else cd.get("picks") or "0",
+              ("红 %s / 蓝 %s" % (pm.group(2), pm.group(3))) if pm else None)
+    c3.metric("优先级评分", cd.get("prio") or "-")
+    c4.metric("系列赛存在率", cd.get("series") or "-")
+    c5.metric("平均选取轮次", cd.get("avg_round") or "-")
+    c6.metric("当前战绩", cd.get("wr") or "-")
+    if cd.get("roles"):
+        st.markdown("**分路表现**")
+        rdf = pd.DataFrame(cd["roles"], columns=["分路", "场次", "胜率", "KDA", "分均伤害"])
+        st.dataframe(rdf, hide_index=True, width='stretch')
+    else:
+        st.caption("该英雄暂无分路明细数据。")
+
+
+# ============================================================
+# 胜率 / 比分预测
+# ============================================================
+
+def _side_wr(d, side):
+    w, l = d.get(side + "_w") or 0, d.get(side + "_l") or 0
+    return w / (w + l) if (w + l) else None
+
+
+def _series_probs(per_game, need):
+    """逐场胜率 -> 系列赛比分概率分布, key=(蓝方胜场, 红方胜场)"""
+    dist = {}
+
+    def rec(i, a, b, p):
+        if a == need or b == need:
+            dist[(a, b)] = dist.get((a, b), 0.0) + p
+            return
+        if i >= len(per_game):
+            return
+        rec(i + 1, a + 1, b, p * per_game[i])
+        rec(i + 1, a, b + 1, p * (1 - per_game[i]))
+
+    rec(0, 0, 0, 1.0)
+    return dist
+
+
+def page_predict(tour, teams):
+    hero("胜率预测 · 对局胜率与 BO1/BO3/BO5 比分概率", "预测页 · 基于两队分边战绩的统计模型 (娱乐向)")
+    names = teams.sort_values("胜率_v", ascending=False)["战队"].tolist()
+    c0, c1 = st.columns(2)
+    team_a = c0.selectbox("🔵 蓝方队伍", names, index=0)
+    team_b = c1.selectbox("🔴 红方队伍", names, index=1 if len(names) > 1 else 0)
+    if team_a == team_b:
+        st.warning("请选择两支不同的队伍。")
+        return
+
+    tids = fetch_team_ids(tour)
+    da = fetch_team_detail(tour, tids.get(team_a, ""))
+    db = fetch_team_detail(tour, tids.get(team_b, ""))
+    wa, ra = _side_wr(da, "blue"), _side_wr(da, "red")
+    wb, rb = _side_wr(db, "blue"), _side_wr(db, "red")
+
+    # 逐场胜率: 场地交替 (A 先蓝)。p(A 蓝方) = A 蓝方胜率 与 B 红方胜率的均值
+    pa_blue = wa if wa is not None else 0.5
+    pb_red = rb if rb is not None else 0.5
+    pa_red = ra if ra is not None else 0.5
+    pb_blue = wb if wb is not None else 0.5
+    p_a_blue_side = 0.5 * pa_blue + 0.5 * (1 - pb_red)
+    p_a_red_side = 0.5 * (1 - pb_blue) + 0.5 * pa_red
+
+    st.markdown("##### 模型输入 (两队真实分边战绩)")
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric(f"{team_a} 蓝方胜率", f"{wa*100:.0f}%" if wa is not None else "数据不足",
+               f"蓝方 {da.get('blue_w', 0)}胜 {da.get('blue_l', 0)}负")
+    mc2.metric(f"{team_a} 红方胜率", f"{ra*100:.0f}%" if ra is not None else "数据不足",
+               f"红方 {da.get('red_w', 0)}胜 {da.get('red_l', 0)}负")
+    mc3.metric(f"{team_b} 蓝方胜率", f"{wb*100:.0f}%" if wb is not None else "数据不足",
+               f"蓝方 {db.get('blue_w', 0)}胜 {db.get('blue_l', 0)}负")
+
+    st.markdown("##### 逐场与系列赛预测")
+    bo3 = [p_a_blue_side, p_a_red_side, p_a_blue_side]
+    bo5 = [p_a_blue_side, p_a_red_side, p_a_blue_side, p_a_red_side, p_a_blue_side]
+    d1, d3, d5 = _series_probs([p_a_blue_side], 1), _series_probs(bo3, 2), _series_probs(bo5, 3)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("BO1 胜率 (蓝方)", f"{p_a_blue_side*100:.0f}%")
+    k2.metric("BO3 系列赛胜率 (蓝方)",
+              f"{sum(p for (a, b), p in d3.items() if a > b)*100:.0f}%")
+    k3.metric("BO5 系列赛胜率 (蓝方)",
+              f"{sum(p for (a, b), p in d5.items() if a > b)*100:.0f}%")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**BO3 比分概率**")
+        rows3 = [{"比分": f"{a} : {b}", "概率": f"{p*100:.1f}%",
+                  "_p": p} for (a, b), p in sorted(d3.items(), key=lambda kv: -kv[1])]
+        fig = px.bar(pd.DataFrame(rows3), x="_p", y="比分", orientation="h",
+                     color="_p", color_continuous_scale=["#3a1a20", "#e5484d"],
+                     text="概率", labels={"_p": "概率"})
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(style_fig(fig, 240), width='stretch')
+    with right:
+        st.markdown("**BO5 比分概率**")
+        rows5 = [{"比分": f"{a} : {b}", "概率": f"{p*100:.1f}%",
+                  "_p": p} for (a, b), p in sorted(d5.items(), key=lambda kv: -kv[1])]
+        fig = px.bar(pd.DataFrame(rows5), x="_p", y="比分", orientation="h",
+                     color="_p", color_continuous_scale=["#241a08", "#e8b64c"],
+                     text="概率", labels={"_p": "概率"})
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(style_fig(fig, 240), width='stretch')
+
+    st.markdown("##### 关键指标对比 (本届数据)")
+    cmp_items = [
+        ("15分钟经济差", (da.get("gd15") or 0), (db.get("gd15") or 0)),
+        ("分均伤害 DPM", (da.get("dpm") or 0), (db.get("dpm") or 0)),
+        ("分均经济 GPM", (da.get("gpm") or 0), (db.get("gpm") or 0)),
+        ("场均小龙", float(re.match(r"[\d.]+", da.get("dragons") or "0").group() or 0),
+         float(re.match(r"[\d.]+", db.get("dragons") or "0").group() or 0)),
+        ("场均男爵", float(re.match(r"[\d.]+", da.get("nashors") or "0").group() or 0),
+         float(re.match(r"[\d.]+", db.get("nashors") or "0").group() or 0)),
+        ("分均视野分", (da.get("vspm") or 0), (db.get("vspm") or 0)),
+    ]
+    fig = go.Figure()
+    fig.add_bar(y=[x[0] for x in cmp_items], x=[x[1] for x in cmp_items],
+                name=team_a, orientation="h", marker_color=BLUE)
+    fig.add_bar(y=[x[0] for x in cmp_items], x=[x[2] for x in cmp_items],
+                name=team_b, orientation="h", marker_color=RED)
+    fig.update_layout(barmode="group")
+    st.plotly_chart(style_fig(fig, 340), width='stretch')
+    st.caption("模型说明: 逐场胜率 = 两队真实蓝/红方胜率的均值组合, 场地按 A 队先蓝交替; "
+               "未考虑选手状态/版本/对局细节, 仅供学习演示, 不构成任何投注建议。")
+
+
+# ============================================================
+# BP 模拟
+# ============================================================
+
+def _champ_zscores(champs):
+    def z(col):
+        s = champs[col]
+        sd = s.std()
+        return (s - s.mean()) / sd if sd else s * 0
+    return 0.5 * z("胜率_v") + 0.3 * z("DPM_v") + 0.2 * z("KDA_v")
+
+
+def page_bp(champs):
+    hero("BP 模拟 · 蓝红方轮流禁用/选取", "BP 页 · 基于本届英雄真实数据的简化模拟 (娱乐向)")
+    if "bp_bans" not in st.session_state:
+        st.session_state.bp_bans = []
+        st.session_state.bp_blue = []
+        st.session_state.bp_red = []
+        st.session_state.bp_history = []
+    bans, blue, red = (st.session_state.bp_bans, st.session_state.bp_blue,
+                       st.session_state.bp_red)
+
+    used = bans + blue + red
+    pool = champs[~champs["英雄"].isin(used)].sort_values("BP率_v", ascending=False)
+    score_map = dict(zip(champs["英雄"], _champ_zscores(champs)))
+
+    st.markdown(f"**当前进度** — 禁用 {len(bans)} · 蓝方选取 {len(blue)} · 红方选取 {len(red)}"
+                f" · 剩余英雄池 {len(pool)}")
+    left, mid, right = st.columns([2, 3, 2])
+
+    with left:
+        st.markdown("#### 🔵 蓝方阵容")
+        if blue:
+            bdf = champs[champs["英雄"].isin(blue)][
+                ["英雄中文名", "胜率", "KDA", "DPM", "BP率"]].copy()
+            bdf["评分"] = bdf["英雄中文名"].map(lambda n: round(
+                score_map.get(champs.loc[champs["英雄中文名"] == n, "英雄"].iloc[0], 0), 2))
+            st.dataframe(bdf, hide_index=True, width='stretch')
+            st.metric("阵容综合评分", f"{sum(score_map.get(x, 0) for x in blue):+.2f}")
+        else:
+            st.caption("尚未选取")
+
+    with right:
+        st.markdown("#### 🔴 红方阵容")
+        if red:
+            rdf = champs[champs["英雄"].isin(red)][
+                ["英雄中文名", "胜率", "KDA", "DPM", "BP率"]].copy()
+            rdf["评分"] = rdf["英雄中文名"].map(lambda n: round(
+                score_map.get(champs.loc[champs["英雄中文名"] == n, "英雄"].iloc[0], 0), 2))
+            st.dataframe(rdf, hide_index=True, width='stretch')
+            st.metric("阵容综合评分", f"{sum(score_map.get(x, 0) for x in red):+.2f}")
+        else:
+            st.caption("尚未选取")
+
+    with mid:
+        st.markdown("#### 🎯 操作台")
+        if len(pool) == 0:
+            st.info("英雄池已用完! 点下方重置开始新一局。")
+        else:
+            options = (pool["英雄中文名"] + " (" + pool["英雄"] + ")").tolist()
+            en_of = dict(zip(options, pool["英雄"]))
+            sel = st.selectbox("选择英雄", options)
+            sel_en = en_of[sel]
+            b1, b2, b3 = st.columns(3)
+            if b1.button("🚫 禁用", use_container_width=True):
+                st.session_state.bp_history.append(("ban", sel_en))
+                bans.append(sel_en)
+            if b2.button("🔵 蓝方拿", use_container_width=True):
+                st.session_state.bp_history.append(("blue", sel_en))
+                blue.append(sel_en)
+            if b3.button("🔴 红方拿", use_container_width=True):
+                st.session_state.bp_history.append(("red", sel_en))
+                red.append(sel_en)
+        b4, b5 = st.columns(2)
+        if b4.button("↩️ 撤销", use_container_width=True):
+            if st.session_state.bp_history:
+                act, name = st.session_state.bp_history.pop()
+                {"ban": bans, "blue": blue, "red": red}[act].remove(name)
+        if b5.button("🗑️ 重置", use_container_width=True):
+            st.session_state.bp_bans = []
+            st.session_state.bp_blue = []
+            st.session_state.bp_red = []
+            st.session_state.bp_history = []
+
+        st.markdown("**💡 系统推荐 (基于真实优先级)**")
+        if len(pool):
+            top_prio = pool.sort_values("优先级_v", ascending=False).head(3)
+            top_pick = pool.sort_values("胜率_v", ascending=False).head(3)
+            st.markdown("**建议禁用** (优先级最高): " + "、".join(
+                top_prio["英雄中文名"] + " (" + top_prio["优先级"] + ")"))
+            st.markdown("**建议选取** (胜率最高): " + "、".join(
+                top_pick["英雄中文名"] + " " + top_pick["胜率"]))
+        if bans:
+            st.markdown("**已禁用**: " + "、".join(zh_champ(x) for x in bans))
+
+    st.caption("规则简化说明: 未还原官方 BP 轮换顺序与体系约束; 阵容评分 = 0.5×胜率分 + "
+               "0.3×分均伤害分 + 0.2×KDA 分 (全体英雄 z-score 加权), 仅供娱乐参考。")
 
 
 def page_compare(tours, tour):
@@ -485,8 +933,9 @@ with st.sidebar:
     st.markdown("## ⚔️ 联赛数据分析中心")
     st.caption("LPL · LCK · LCP · 真实数据 gol.gg")
     page = option_menu(
-        None, ["总览", "战队榜", "选手榜", "英雄榜", "赛季对比"],
-        icons=["speedometer2", "trophy", "person-badge", "controller", "graph-up-arrow"],
+        None, ["总览", "战队榜", "选手榜", "英雄榜", "胜率预测", "BP 模拟", "赛季对比"],
+        icons=["speedometer2", "trophy", "person-badge", "controller",
+               "lightning-charge", "shuffle", "graph-up-arrow"],
         default_index=0, styles=MENU_STYLES)
     st.divider()
     leagues = list_all_tournaments()
@@ -511,11 +960,15 @@ try:
     if page == "总览":
         page_overview(tour, teams, players, champs)
     elif page == "战队榜":
-        page_teams(teams)
+        page_teams(tour, teams)
     elif page == "选手榜":
         page_players(players)
     elif page == "英雄榜":
-        page_champions(champs, teams)
+        page_champions(tour, champs)
+    elif page == "胜率预测":
+        page_predict(tour, teams)
+    elif page == "BP 模拟":
+        page_bp(champs)
     elif page == "赛季对比":
         page_compare(tours, tour)
     st.divider()
