@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LPL 数据分析中心 · Streamlit Demo
+LoL 联赛数据分析中心 (LPL/LCK/LCP) · Streamlit Demo
 数据来源: Games of Legends (gol.gg) 公开统计页面
 """
 import json
@@ -68,15 +68,33 @@ def _parse_rows(html, link_kw):
     return th, out
 
 
-@st.cache_data(ttl=1800, show_spinner="正在从 gol.gg 拉取 LPL 赛事列表 ...")
-def list_lpl_tournaments():
+@st.cache_data(ttl=1800, show_spinner="正在从 gol.gg 拉取赛事列表 ...")
+def list_all_tournaments():
+    """返回 {联赛: [赛事名...]} (按 gol.gg 原序, 新赛事在前), 仅 LPL/LCK/LCP 主联赛"""
     html = _get(BASE + "/players/list/season-ALL/split-ALL/tournament-ALL/")
     m = re.search(r"<select id='cbtournament'.*?</select>", html, re.S)
     if not m:
-        return []
+        return {}
     opts = re.findall(r"<option[^>]*value='([^']+)'[^>]*>\s*([^<]+?)\s*</option>", m.group(0))
-    names = [v.strip() for v, n in opts if n.strip().startswith("LPL ")]
-    return names
+    leagues = {lg: [] for lg in ("LPL", "LCK", "LCP")}
+    for v, n in opts:
+        name = n.strip()
+        for lg in leagues:
+            # 只收主联赛, 排除 LCK CL 等次级联赛
+            if name.startswith(lg + " ") and not name.startswith(lg + " CL"):
+                leagues[lg].append(name)
+    return leagues
+
+
+def default_tournament(names):
+    """默认赛事启发式: 最新常规赛 (Split N 最大 / Rounds 列表最前), 否则取列表头"""
+    splits = [n for n in names if re.search(r"Split \d$", n)]
+    if splits:
+        return max(splits, key=lambda s: int(re.search(r"(\d+)$", s).group(1)))
+    rounds = [n for n in names if "Rounds" in n]
+    if rounds:
+        return rounds[0]
+    return names[0] if names else ""
 
 
 @st.cache_data(ttl=1800, show_spinner="正在拉取选手数据 ...")
@@ -249,10 +267,10 @@ def hero(title, sub):
         <div style="background:linear-gradient(120deg,#1a2132,#131824 55%,#241018);
              border:1px solid #242d42;border-radius:14px;padding:22px 26px;margin-bottom:18px;">
           <div style="font-size:24px;font-weight:800;letter-spacing:1px;color:#ffffff;">
-            LPL 数据分析中心
+            LoL 联赛数据分析中心
             <span style="font-size:12px;font-weight:400;color:#e8b64c;
               border:1px solid rgba(232,182,76,.4);border-radius:20px;padding:2px 10px;
-              margin-left:10px;vertical-align:middle;">真实数据 · gol.gg</span>
+              margin-left:10px;vertical-align:middle;">LPL · LCK · LCP · 真实数据 gol.gg</span>
           </div>
           <div style="color:#8a93a8;font-size:13px;margin-top:6px;">{sub}</div>
           <div style="color:#5c667e;font-size:11px;margin-top:4px;">{title}</div>
@@ -267,7 +285,7 @@ def hero(title, sub):
 # ============================================================
 
 def page_overview(tour, teams, players, champs):
-    hero(tour, "总览 · 本届 LPL 赛事核心指标与头部榜单")
+    hero(tour, "总览 · 本届赛事核心指标与头部榜单")
     n_games = int(teams["场次_v"].sum() // 2) if len(teams) else 0
     avg_dur = teams["时长_min"].mean() if len(teams) else 0
     avg_kill = (teams["场均击杀_v"].mean() + teams["场均死亡_v"].mean()) / 2 if len(teams) else 0
@@ -408,11 +426,15 @@ def page_champions(champs, teams):
 
 
 def page_compare(tours, tour):
-    hero("赛季对比页 · 同年各 Split 横向对比", "赛季对比页 · 拉取多届数据自动对比")
-    splits = [t for t in tours if re.search(r"Split \d$", t)] or tours
+    lg = tour.split(" ")[0] if tour else "LPL"
+    year = (re.search(r"(20\d\d)", tour).group(1) if re.search(r"(20\d\d)", tour) else "")
+    hero("赛季对比页 · 同年各赛事横向对比", "赛季对比页 · 拉取该联赛多届数据自动对比")
+    # 排除次级/表演性质阶段, 按年份过滤; gol.gg 列表新赛事在前
+    stages = [t for t in tours if t.startswith(lg + " ") and " CL " not in t
+              and (not year or year in t)] or list(tours)
     frames = {}
-    with st.status("正在拉取各 Split 战队数据 ...", expanded=True) as s:
-        for t in splits:
+    with st.status("正在拉取各赛事战队数据 ...", expanded=True) as s:
+        for t in stages:
             st.write("→ " + t)
             frames[t] = fetch_teams(t)
         s.update(label="拉取完成", state="complete")
@@ -421,7 +443,7 @@ def page_compare(tours, tour):
         if not len(df):
             continue
         rows.append({
-            "赛事": t.replace("LPL 2026 ", ""),
+            "赛事": t.replace(lg + " " + year + " ", "") if year else t,
             "战队数": len(df),
             "总场次": int(df["场次_v"].sum() // 2),
             "场均时长(min)": round(df["时长_min"].mean(), 2),
@@ -430,7 +452,7 @@ def page_compare(tours, tour):
             "平均胜率差(pp)": round(df["胜率_v"].max() - df["胜率_v"].min(), 1),
         })
     cmp_df = pd.DataFrame(rows)
-    st.markdown("##### 各 Split 核心指标")
+    st.markdown(f"##### {lg} 各赛事核心指标")
     st.dataframe(cmp_df, hide_index=True, width='stretch')
 
     if len(cmp_df) >= 2:
@@ -455,25 +477,25 @@ def page_compare(tours, tour):
 # ============================================================
 # 主入口
 # ============================================================
-st.set_page_config(page_title="LPL 数据分析中心", page_icon="⚔️",
+st.set_page_config(page_title="LoL 联赛数据分析中心", page_icon="⚔️",
                    layout="wide", initial_sidebar_state="expanded")
 st.markdown(CSS, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("## ⚔️ LPL 数据分析中心")
-    st.caption("真实数据 · Games of Legends (gol.gg)")
+    st.markdown("## ⚔️ 联赛数据分析中心")
+    st.caption("LPL · LCK · LCP · 真实数据 gol.gg")
     page = option_menu(
         None, ["总览", "战队榜", "选手榜", "英雄榜", "赛季对比"],
-        icons=["speedometer2", "trophy", "person-badge", "-controller", "graph-up-arrow"],
+        icons=["speedometer2", "trophy", "person-badge", "controller", "graph-up-arrow"],
         default_index=0, styles=MENU_STYLES)
     st.divider()
-    tours = list_lpl_tournaments()
+    leagues = list_all_tournaments()
+    league = st.selectbox("选择联赛", ["LPL", "LCK", "LCP"])
+    tours = leagues.get(league, [])
     if tours:
-        # 默认选最新且有数据的 Split
-        splits = [t for t in tours if re.search(r"Split \d$", t)]
-        default = max(splits, key=lambda s: int(re.search(r"(\d+)$", s).group(1))) if splits else tours[0]
         tour = st.selectbox("选择赛事", tours,
-                            index=tours.index(default) if default in tours else 0)
+                            index=tours.index(default_tournament(tours))
+                            if default_tournament(tours) in tours else 0)
     else:
         tour = "LPL 2026 Split 3"
         st.error("赛事列表拉取失败, 使用默认赛事 (云端首次部署可能较慢, 刷新重试)")
@@ -497,7 +519,7 @@ try:
     elif page == "赛季对比":
         page_compare(tours, tour)
     st.divider()
-    st.caption("数据来源: [Games of Legends](https://gol.gg) · League of Legends 及 LPL 版权归 Riot Games / 腾竞体育所有 · 本页面仅为数据分析 Demo")
+    st.caption("数据来源: [Games of Legends](https://gol.gg) · League of Legends 及 LPL/LCK/LCP 版权归 Riot Games 及各赛区版权方所有 · 本页面仅为数据分析 Demo")
 except Exception as e:
     st.error(f"数据拉取失败: {type(e).__name__}: {e}")
     st.info("gol.gg 偶尔限流, 请稍后刷新页面; 若在本地运行请检查网络能否访问 gol.gg。")
