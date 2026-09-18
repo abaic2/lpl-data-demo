@@ -1,0 +1,3 @@
+probe_gol*.py
+streamlit*.log
+__pycache__/
