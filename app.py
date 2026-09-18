@@ -273,6 +273,34 @@ def fetch_team_detail(tournament, team_id):
     return d
 
 
+@st.cache_data(ttl=1800, show_spinner="正在聚合各战队英雄池 ...")
+def fetch_team_pools(tournament):
+    """聚合全部战队详情 -> {战队: {"roster": [...], "pool": {英雄: (胜率, 场次)}}},
+    同时产出英雄->位置映射 (基于本届实际登场) 与战队详情缓存 dict"""
+    ids = fetch_team_ids(tournament)
+    details, pools, role_map = {}, {}, {}
+    for name, tid in ids.items():
+        d = fetch_team_detail(tournament, tid)
+        details[name] = d
+        pool = {}
+        for r in d.get("roster", []):
+            role = r.get("位置", "")
+            for h, wr, _kda, games in r.get("英雄池", []):
+                g = int(games) if games.isdigit() else 0
+                try:
+                    w = float(wr)
+                except ValueError:
+                    w = None
+                if w is None:
+                    continue
+                old = pool.get(h)
+                if not old or g > old[1]:
+                    pool[h] = (w, g)
+                role_map.setdefault(h, role)
+        pools[name] = {"roster": d.get("roster", []), "pool": pool}
+    return {"details": details, "pools": pools, "role_map": role_map}
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_champion_ids(tournament):
     tok = urllib.parse.quote(tournament)
@@ -685,9 +713,27 @@ def _series_probs(per_game, need):
     return dist
 
 
+def _power_scores(teams):
+    """差异化实力评分: 多维真实指标 z-score 加权, 每队得分不同"""
+    def z(s):
+        sd = s.std()
+        return (s - s.mean()) / sd if sd else s * 0
+    diff = teams["场均击杀_v"] - teams["场均死亡_v"]
+    return (0.35 * z(teams["胜率_v"]) + 0.20 * z(diff)
+            + 0.20 * z(teams["场均推塔_v"]) + 0.15 * z(teams["GPM_v"])
+            + 0.10 * z(-teams["时长_min"]))
+
+
+def _logistic(x):
+    return 1 / (1 + pow(2.718281828, -x))
+
+
 def page_predict(tour, teams):
-    hero("胜率预测 · 对局胜率与 BO1/BO3/BO5 比分概率", "预测页 · 基于两队分边战绩的统计模型 (娱乐向)")
-    names = teams.sort_values("胜率_v", ascending=False)["战队"].tolist()
+    hero("胜率预测 · 差异化实力评分 + 分边修正 + 比分概率", "预测页 · 多维指标评分模型 (娱乐向)")
+    teams = teams.copy()
+    teams["实力评分"] = _power_scores(teams)
+    ranked = teams.sort_values("实力评分", ascending=False).reset_index(drop=True)
+    names = ranked["战队"].tolist()
     c0, c1 = st.columns(2)
     team_a = c0.selectbox("🔵 蓝方队伍", names, index=0)
     team_b = c1.selectbox("🔴 红方队伍", names, index=1 if len(names) > 1 else 0)
@@ -695,40 +741,79 @@ def page_predict(tour, teams):
         st.warning("请选择两支不同的队伍。")
         return
 
+    ra_row = ranked[ranked["战队"] == team_a].iloc[0]
+    rb_row = ranked[ranked["战队"] == team_b].iloc[0]
+    pow_a, pow_b = ra_row["实力评分"], rb_row["实力评分"]
+
+    st.markdown("##### 差异化实力评分 (每队独立, 联赛内标准化)")
+    k0, k1, k2 = st.columns(3)
+    k0.metric(f"{team_a} 综合评分", f"{pow_a:+.2f}",
+              f"联赛第 {int(ra_row.name) + 1} 名")
+    k1.metric(f"{team_b} 综合评分", f"{pow_b:+.2f}",
+              f"联赛第 {int(rb_row.name) + 1} 名")
+    k2.metric("评分差", f"{pow_a - pow_b:+.2f}")
+
+    # 评分构成对比 (z 分量)
+    def _components(row):
+        def z(col, invert=False):
+            s = teams[col]
+            v = row[col] * (-1 if invert else 1)
+            sd = s.std()
+            return ((s * (-1 if invert else 1) - (s * (-1 if invert else 1)).mean()) / sd) if sd else 0
+        return {
+            "胜率": z("胜率_v"),
+            "击杀差": z("场均击杀_v") - z("场均死亡_v"),
+            "推塔": z("场均推塔_v"),
+            "经济 GPM": z("GPM_v"),
+            "节奏(时长反向)": z("时长_min", invert=True),
+        }
+
+    comp_a, comp_b = _components(ra_row), _components(rb_row)
+    labels = list(comp_a.keys())
+    fig = go.Figure()
+    fig.add_bar(y=labels, x=[comp_a[k] for k in labels], name=team_a,
+                orientation="h", marker_color=BLUE)
+    fig.add_bar(y=labels, x=[comp_b[k] for k in labels], name=team_b,
+                orientation="h", marker_color=RED)
+    fig.update_layout(barmode="group", xaxis_title="联赛内 z-score")
+    st.plotly_chart(style_fig(fig, 320), width='stretch')
+
+    # 分边修正
     tids = fetch_team_ids(tour)
     da = fetch_team_detail(tour, tids.get(team_a, ""))
     db = fetch_team_detail(tour, tids.get(team_b, ""))
-    wa, ra = _side_wr(da, "blue"), _side_wr(da, "red")
-    wb, rb = _side_wr(db, "blue"), _side_wr(db, "red")
-
-    # 逐场胜率: 场地交替 (A 先蓝)。p(A 蓝方) = A 蓝方胜率 与 B 红方胜率的均值
-    pa_blue = wa if wa is not None else 0.5
-    pb_red = rb if rb is not None else 0.5
-    pa_red = ra if ra is not None else 0.5
-    pb_blue = wb if wb is not None else 0.5
-    p_a_blue_side = 0.5 * pa_blue + 0.5 * (1 - pb_red)
-    p_a_red_side = 0.5 * (1 - pb_blue) + 0.5 * pa_red
+    wa, ra_w = _side_wr(da, "blue"), _side_wr(da, "red")
+    wb, rb_w = _side_wr(db, "blue"), _side_wr(db, "red")
+    p_a_blue_side = 0.5 * (wa if wa is not None else 0.5) + 0.5 * (1 - (rb_w if rb_w is not None else 0.5))
+    p_a_red_side = 0.5 * (1 - (wb if wb is not None else 0.5)) + 0.5 * (ra_w if ra_w is not None else 0.5)
 
     st.markdown("##### 模型输入 (两队真实分边战绩)")
     mc1, mc2, mc3 = st.columns(3)
-    mc1.metric(f"{team_a} 蓝方胜率", f"{wa*100:.0f}%" if wa is not None else "数据不足",
-               f"蓝方 {da.get('blue_w', 0)}胜 {da.get('blue_l', 0)}负")
-    mc2.metric(f"{team_a} 红方胜率", f"{ra*100:.0f}%" if ra is not None else "数据不足",
-               f"红方 {da.get('red_w', 0)}胜 {da.get('red_l', 0)}负")
-    mc3.metric(f"{team_b} 蓝方胜率", f"{wb*100:.0f}%" if wb is not None else "数据不足",
-               f"蓝方 {db.get('blue_w', 0)}胜 {db.get('blue_l', 0)}负")
+    mc1.metric(f"{team_a} 蓝/红方胜率",
+               (f"{wa*100:.0f}%" if wa is not None else "-") + " / " +
+               (f"{ra_w*100:.0f}%" if ra_w is not None else "-"))
+    mc2.metric(f"{team_b} 蓝/红方胜率",
+               (f"{wb*100:.0f}%" if wb is not None else "-") + " / " +
+               (f"{rb_w*100:.0f}%" if rb_w is not None else "-"))
+    mc3.metric("场地顺序", "A 队先蓝, 交替")
+
+    # 逐场胜率 = 实力分模型与分边模型各占一半
+    p_power = _logistic(1.8 * (pow_a - pow_b))
+    p_game_blue = 0.5 * p_power + 0.5 * p_a_blue_side
+    # A 在红方局: P(B 蓝) = 0.5*实力分(B) + 0.5*(1 - p_a_red_side)
+    p_game_red = 1 - (0.5 * _logistic(1.8 * (pow_b - pow_a)) + 0.5 * (1 - p_a_red_side))
 
     st.markdown("##### 逐场与系列赛预测")
-    bo3 = [p_a_blue_side, p_a_red_side, p_a_blue_side]
-    bo5 = [p_a_blue_side, p_a_red_side, p_a_blue_side, p_a_red_side, p_a_blue_side]
-    d1, d3, d5 = _series_probs([p_a_blue_side], 1), _series_probs(bo3, 2), _series_probs(bo5, 3)
+    bo3 = [p_game_blue, p_game_red, p_game_blue]
+    bo5 = [p_game_blue, p_game_red, p_game_blue, p_game_red, p_game_blue]
+    d3, d5 = _series_probs(bo3, 2), _series_probs(bo5, 3)
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("BO1 胜率 (蓝方)", f"{p_a_blue_side*100:.0f}%")
-    k2.metric("BO3 系列赛胜率 (蓝方)",
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("实力分模型 BO1", f"{p_power*100:.0f}%")
+    k2.metric("分边模型 BO1 (A 先蓝)", f"{p_a_blue_side*100:.0f}%")
+    k3.metric("综合 BO1 (蓝方第 1 局)", f"{p_game_blue*100:.0f}%")
+    k4.metric("BO3 系列赛胜率 (蓝方)",
               f"{sum(p for (a, b), p in d3.items() if a > b)*100:.0f}%")
-    k3.metric("BO5 系列赛胜率 (蓝方)",
-              f"{sum(p for (a, b), p in d5.items() if a > b)*100:.0f}%")
 
     left, right = st.columns(2)
     with left:
@@ -770,8 +855,9 @@ def page_predict(tour, teams):
                 name=team_b, orientation="h", marker_color=RED)
     fig.update_layout(barmode="group")
     st.plotly_chart(style_fig(fig, 340), width='stretch')
-    st.caption("模型说明: 逐场胜率 = 两队真实蓝/红方胜率的均值组合, 场地按 A 队先蓝交替; "
-               "未考虑选手状态/版本/对局细节, 仅供学习演示, 不构成任何投注建议。")
+    st.caption("模型说明: 实力评分 = 0.35×胜率 + 0.20×击杀差 + 0.20×推塔 + 0.15×GPM + "
+               "0.10×节奏 (联赛内 z-score, 每队得分不同); 逐场胜率 = 实力分模型与分边战绩模型各占 50%, "
+               "场地按 A 队先蓝交替。仅供学习演示, 不构成任何投注建议。")
 
 
 # ============================================================
@@ -786,8 +872,42 @@ def _champ_zscores(champs):
     return 0.5 * z("胜率_v") + 0.3 * z("DPM_v") + 0.2 * z("KDA_v")
 
 
-def page_bp(champs):
-    hero("BP 模拟 · 蓝红方轮流禁用/选取", "BP 页 · 基于本届英雄真实数据的简化模拟 (娱乐向)")
+ROLE_ZH = {"TOP": "上单", "JUNGLE": "打野", "MID": "中单", "BOT": "ADC", "SUPPORT": "辅助"}
+
+
+def _pool_metrics(team, tp):
+    """返回该队英雄池 {英文英雄名: (本队胜率, 场次)} 与选手列表"""
+    info = tp["pools"].get(team, {})
+    return info.get("pool", {}), info.get("roster", [])
+
+
+def _pick_score(en, team_pool, score_map):
+    """评分 = 全局 z-score + 本队熟练度加成 (池内英雄按本队真实胜率)"""
+    s = score_map.get(en, 0.0)
+    p = team_pool.get(en)
+    if p:
+        s += (p[0] - 50) / 10 * 0.5
+    return s
+
+
+def page_bp(tour, champs):
+    hero("BP 模拟 · 战队对抗 / 位置分栏 / 英雄池推荐", "BP 页 · 基于两队本届真实英雄池的模拟 (娱乐向)")
+    tp = fetch_team_pools(tour)
+    team_names = sorted(tp["pools"].keys())
+    if not team_names:
+        st.warning("战队英雄池数据拉取失败, 请稍后刷新。")
+        return
+
+    c0, c1 = st.columns(2)
+    blue_team = c0.selectbox("🔵 蓝方战队", team_names, index=0)
+    red_team = c1.selectbox("🔴 红方战队", team_names,
+                            index=1 if len(team_names) > 1 else 0)
+    if blue_team == red_team:
+        st.warning("请选择两支不同的战队。")
+        return
+    blue_pool, blue_roster = _pool_metrics(blue_team, tp)
+    red_pool, red_roster = _pool_metrics(red_team, tp)
+
     if "bp_bans" not in st.session_state:
         st.session_state.bp_bans = []
         st.session_state.bp_blue = []
@@ -797,56 +917,81 @@ def page_bp(champs):
                        st.session_state.bp_red)
 
     used = bans + blue + red
-    pool = champs[~champs["英雄"].isin(used)].sort_values("BP率_v", ascending=False)
+    pool = champs[~champs["英雄"].isin(used)].copy()
     score_map = dict(zip(champs["英雄"], _champ_zscores(champs)))
 
-    st.markdown(f"**当前进度** — 禁用 {len(bans)} · 蓝方选取 {len(blue)} · 红方选取 {len(red)}"
+    # 位置标注 (基于本届各队实际登场的英雄->位置映射)
+    pool["位置"] = pool["英雄"].map(lambda h: ROLE_ZH.get(tp["role_map"].get(h, ""), "其他"))
+
+    st.markdown(f"**当前进度** — 禁用 {len(bans)} · 蓝方 {len(blue)} · 红方 {len(red)}"
                 f" · 剩余英雄池 {len(pool)}")
     left, mid, right = st.columns([2, 3, 2])
 
-    with left:
-        st.markdown("#### 🔵 蓝方阵容")
-        if blue:
-            bdf = champs[champs["英雄"].isin(blue)][
-                ["英雄中文名", "胜率", "KDA", "DPM", "BP率"]].copy()
-            bdf["评分"] = bdf["英雄中文名"].map(lambda n: round(
-                score_map.get(champs.loc[champs["英雄中文名"] == n, "英雄"].iloc[0], 0), 2))
-            st.dataframe(bdf, hide_index=True, width='stretch')
-            st.metric("阵容综合评分", f"{sum(score_map.get(x, 0) for x in blue):+.2f}")
+    def _roster_block(team, picks, team_pool):
+        st.markdown(f"#### {'🔵' if team == blue_team else '🔴'} {team}")
+        if picks:
+            rows = []
+            for en in picks:
+                p = team_pool.get(en)
+                rows.append({
+                    "英雄": zh_champ(en), "英文名": en,
+                    "本队胜率": f"{p[0]:.0f}% ({p[1]}场)" if p else "场外选人",
+                    "评分": f"{_pick_score(en, team_pool, score_map):+.2f}",
+                })
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+            st.metric("阵容综合评分", f"{sum(_pick_score(x, team_pool, score_map) for x in picks):+.2f}",
+                      f"本队英雄池 {sum(1 for x in picks if x in team_pool)}/{len(picks)}")
         else:
             st.caption("尚未选取")
+        pool_txt = []
+        for r in (blue_roster if team == blue_team else red_roster):
+            tops = sorted(r.get("英雄池") or [], key=lambda x: -(float(x[1]) if x[1] else 0))[:2]
+            if tops:
+                pool_txt.append(f"`{ROLE_ZH.get(r['位置'], r['位置'])}` {r['选手']}: "
+                                + " / ".join(f"{zh_champ(h)} {wr}%" for h, wr, _k, _g in tops))
+        if pool_txt:
+            with st.expander("👥 本队选手英雄池 (前 2)"):
+                st.markdown("<br>".join(pool_txt), unsafe_allow_html=True)
 
+    with left:
+        _roster_block(blue_team, blue, blue_pool)
     with right:
-        st.markdown("#### 🔴 红方阵容")
-        if red:
-            rdf = champs[champs["英雄"].isin(red)][
-                ["英雄中文名", "胜率", "KDA", "DPM", "BP率"]].copy()
-            rdf["评分"] = rdf["英雄中文名"].map(lambda n: round(
-                score_map.get(champs.loc[champs["英雄中文名"] == n, "英雄"].iloc[0], 0), 2))
-            st.dataframe(rdf, hide_index=True, width='stretch')
-            st.metric("阵容综合评分", f"{sum(score_map.get(x, 0) for x in red):+.2f}")
-        else:
-            st.caption("尚未选取")
+        _roster_block(red_team, red, red_pool)
 
     with mid:
         st.markdown("#### 🎯 操作台")
         if len(pool) == 0:
             st.info("英雄池已用完! 点下方重置开始新一局。")
         else:
-            options = (pool["英雄中文名"] + " (" + pool["英雄"] + ")").tolist()
-            en_of = dict(zip(options, pool["英雄"]))
-            sel = st.selectbox("选择英雄", options)
-            sel_en = en_of[sel]
-            b1, b2, b3 = st.columns(3)
-            if b1.button("🚫 禁用", use_container_width=True):
-                st.session_state.bp_history.append(("ban", sel_en))
-                bans.append(sel_en)
-            if b2.button("🔵 蓝方拿", use_container_width=True):
-                st.session_state.bp_history.append(("blue", sel_en))
-                blue.append(sel_en)
-            if b3.button("🔴 红方拿", use_container_width=True):
-                st.session_state.bp_history.append(("red", sel_en))
-                red.append(sel_en)
+            # 搜索 + 位置筛选
+            q = st.text_input("🔍 搜索英雄 (中文名或英文名)", "").strip().lower()
+            role = st.radio("位置", ["全部", "上单", "打野", "中单", "ADC", "辅助", "其他"],
+                            horizontal=True)
+            fp = pool
+            if role != "全部":
+                fp = fp[fp["位置"] == role]
+            if q:
+                fp = fp[fp["英雄"].str.lower().str.contains(q, regex=False)
+                        | fp["英雄中文名"].str.contains(q, regex=False)]
+            if len(fp) == 0:
+                st.info("没有符合条件的英雄。")
+            else:
+                fp = fp.sort_values("BP率_v", ascending=False)
+                options = (fp["英雄中文名"] + " (" + fp["英雄"] + ") · 胜率 " + fp["胜率"]
+                           + " · BP率 " + fp["BP率"]).tolist()
+                en_of = dict(zip(options, fp["英雄"]))
+                sel = st.selectbox(f"选择英雄 ({len(fp)} 个)", options)
+                sel_en = en_of[sel]
+                b1, b2, b3 = st.columns(3)
+                if b1.button("🚫 禁用", use_container_width=True):
+                    st.session_state.bp_history.append(("ban", sel_en))
+                    bans.append(sel_en)
+                if b2.button("🔵 蓝方拿", use_container_width=True):
+                    st.session_state.bp_history.append(("blue", sel_en))
+                    blue.append(sel_en)
+                if b3.button("🔴 红方拿", use_container_width=True):
+                    st.session_state.bp_history.append(("red", sel_en))
+                    red.append(sel_en)
         b4, b5 = st.columns(2)
         if b4.button("↩️ 撤销", use_container_width=True):
             if st.session_state.bp_history:
@@ -858,19 +1003,49 @@ def page_bp(champs):
             st.session_state.bp_red = []
             st.session_state.bp_history = []
 
-        st.markdown("**💡 系统推荐 (基于真实优先级)**")
+        # 基于本队英雄池的推荐
+        st.markdown("**💡 英雄池推荐 (基于两队本届真实选用)**")
+
+        def _rec(team, opp_pool, kind):
+            my = tp["pools"].get(team, {}).get("pool", {})
+            cand = [(h, w, g) for h, (w, g) in my.items()
+                    if h not in used and w is not None]
+            if kind == "ban":
+                # 建议禁用: 对方池中最强且仍可选的
+                opp = [(h, w, g) for h, (w, g) in opp_pool.items()
+                       if h not in used and w is not None]
+                cand = sorted(opp, key=lambda x: (-x[1], -x[2]))[:3]
+                tag = "对方绝活"
+            else:
+                cand = sorted(cand, key=lambda x: (-x[1], -x[2]))[:3]
+                tag = "本队绝活"
+            if not cand:
+                return tag, None
+            h, w, g = cand[0]
+            zh = zh_champ(h)
+            extra = f" · 本队 {w:.0f}% ({g}场)" if kind != "ban" else \
+                f" · 对方 {w:.0f}% ({g}场)"
+            return tag, f"**{zh}** ({h}){extra}"
+
         if len(pool):
-            top_prio = pool.sort_values("优先级_v", ascending=False).head(3)
-            top_pick = pool.sort_values("胜率_v", ascending=False).head(3)
-            st.markdown("**建议禁用** (优先级最高): " + "、".join(
-                top_prio["英雄中文名"] + " (" + top_prio["优先级"] + ")"))
-            st.markdown("**建议选取** (胜率最高): " + "、".join(
-                top_pick["英雄中文名"] + " " + top_pick["胜率"]))
+            t1, r1 = _rec(blue_team, red_pool, "pick")
+            t2, r2 = _rec(red_team, blue_pool, "pick")
+            t3, r3 = _rec(blue_team, red_pool, "ban")
+            t4, r4 = _rec(red_team, blue_pool, "ban")
+            st.markdown(f"- 🔵 蓝方建议选取 ({t1}): {r1 or '池内已无'}")
+            st.markdown(f"- 🔴 红方建议选取 ({t2}): {r2 or '池内已无'}")
+            st.markdown(f"- 🚫 蓝方建议禁用 ({t3}): {r3 or '无'}")
+            st.markdown(f"- 🚫 红方建议禁用 ({t4}): {r4 or '无'}")
+            bp = pool.sort_values("优先级_v", ascending=False).head(1)
+            if len(bp):
+                st.markdown(f"- 📈 全局版本优先级最高: **{bp.iloc[0]['英雄中文名']}** "
+                            f"(优先级 {bp.iloc[0]['优先级']})")
         if bans:
             st.markdown("**已禁用**: " + "、".join(zh_champ(x) for x in bans))
 
-    st.caption("规则简化说明: 未还原官方 BP 轮换顺序与体系约束; 阵容评分 = 0.5×胜率分 + "
-               "0.3×分均伤害分 + 0.2×KDA 分 (全体英雄 z-score 加权), 仅供娱乐参考。")
+    st.caption("规则简化说明: 未还原官方 BP 轮换顺序; 评分 = 全局 z-score (0.5 胜率 + 0.3 DPM + "
+               "0.2 KDA) + 本队熟练度加成 (英雄在本队真实胜率, 池外选人无加成); "
+               "推荐基于两队本届实际选用的英雄池, 仅供娱乐参考。")
 
 
 def page_compare(tours, tour):
@@ -968,7 +1143,7 @@ try:
     elif page == "胜率预测":
         page_predict(tour, teams)
     elif page == "BP 模拟":
-        page_bp(champs)
+        page_bp(tour, champs)
     elif page == "赛季对比":
         page_compare(tours, tour)
     st.divider()
